@@ -6,12 +6,12 @@ from typing import Dict, List
 from dataclasses import dataclass
 
 # Import Chatterbox components
-from chatterbox.tts import ChatterboxTTS
+from src.chatterbox.tts import ChatterboxTTS
 from huggingface_hub import hf_hub_download
 import shutil
 
 # Hardcoded configuration - MODIFY THESE
-CHECKPOINT_PATH = "./checkpoints_lora/checkpoint_epoch7_step1248.pt"  # Path to your checkpoint
+CHECKPOINT_PATH = "./checkpoints_lora/checkpoint_epoch9_step1020.pt"  # Path to your checkpoint
 OUTPUT_DIR = "./checkpoints_lora/merged_model"  # Where to save the merged model
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -148,7 +148,7 @@ def main():
     
     # Load base model
     print("\nLoading base Chatterbox model...")
-    model = ChatterboxTTS.from_pretrained(DEVICE)
+    model = ChatterboxTTS.from_local("./viterbox", DEVICE)
     
     # Inject LoRA layers
     print("\nInjecting LoRA layers...")
