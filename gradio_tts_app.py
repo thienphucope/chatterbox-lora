@@ -2,7 +2,7 @@ import random
 import numpy as np
 import torch
 import gradio as gr
-from chatterbox.tts import ChatterboxTTS
+from src.chatterbox.tts import ChatterboxTTS
 
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -17,7 +17,7 @@ def set_seed(seed: int):
 
 
 def load_model():
-    model = ChatterboxTTS.from_pretrained(DEVICE)
+    model = ChatterboxTTS.from_local("./checkpoints_lora/merged_model", DEVICE)
     return model
 
 
