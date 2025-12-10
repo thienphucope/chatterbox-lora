@@ -20,12 +20,12 @@ from tqdm import tqdm
 from huggingface_hub import hf_hub_download
 
 # Import Chatterbox components
-from chatterbox.tts import ChatterboxTTS, punc_norm
-from chatterbox.models.s3gen import S3Gen, S3GEN_SR
-from chatterbox.models.s3tokenizer import S3_SR
-from chatterbox.models.voice_encoder import VoiceEncoder
-from chatterbox.models.tokenizers import EnTokenizer
-from chatterbox.models.t3.modules.cond_enc import T3Cond
+from src.chatterbox.tts import ChatterboxTTS, punc_norm
+from src.chatterbox.models.s3gen import S3Gen, S3GEN_SR
+from src.chatterbox.models.s3tokenizer import S3_SR
+from src.chatterbox.models.voice_encoder import VoiceEncoder
+from src.chatterbox.models.tokenizers import EnTokenizer
+from src.chatterbox.models.t3.modules.cond_enc import T3Cond
 
 # Add matplotlib imports for metrics tracking
 import matplotlib
@@ -737,10 +737,10 @@ def main():
     print(f"Train samples: {len(train_samples)}, Validation samples: {len(val_samples)}")
     whisper_model.model.cpu()
     # Load Chatterbox model
-    print("Loading Chatterbox TTS model...")
-    model = ChatterboxTTS.from_pretrained(DEVICE)
+    # print("Loading Chatterbox TTS model...")
+    # model = ChatterboxTTS.from_pretrained(DEVICE)
     # Restart training
-    #model = ChatterboxTTS.from_local("./checkpoints_lora/merged_model", DEVICE)
+    model = ChatterboxTTS.from_local("./viterbox", DEVICE)
 
     # Inject LoRA layers
     print("Injecting LoRA layers...")
