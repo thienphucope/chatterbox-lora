@@ -162,7 +162,7 @@ class ChatterboxTTS:
 
         s3gen = S3Gen()
         s3gen.load_state_dict(
-            torch.load(ckpt_dir / "s3gen.pt", map_location=map_location)
+            torch.load(ckpt_dir / "s3gen.pt", map_location=map_location), strict=False
         )
         s3gen.to(device).eval()
 
