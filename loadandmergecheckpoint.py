@@ -11,7 +11,7 @@ from huggingface_hub import hf_hub_download
 import shutil
 
 # Hardcoded configuration - MODIFY THESE
-CHECKPOINT_PATH = "./checkpoints_lora/checkpoint_epoch9_step1020.pt"  # Path to your checkpoint
+CHECKPOINT_PATH = "./checkpoints_lora/checkpoint_epoch4_step510.pt"  # Path to your checkpoint
 OUTPUT_DIR = "./checkpoints_lora/merged_model"  # Where to save the merged model
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -113,10 +113,10 @@ def save_merged_model(model: ChatterboxTTS, output_dir: Path):
     torch.save(model.t3.state_dict(), output_dir / "t3_cfg.pt")
     torch.save(model.s3gen.state_dict(), output_dir / "s3gen.pt")
     
-    # Copy tokenizer
-    print("Copying tokenizer...")
-    tokenizer_path = Path(hf_hub_download(repo_id="ResembleAI/chatterbox", filename="tokenizer.json"))
-    shutil.copy(tokenizer_path, output_dir / "tokenizer.json")
+    # # Copy tokenizer
+    # print("Copying tokenizer...")
+    # tokenizer_path = Path(hf_hub_download(repo_id="ResembleAI/chatterbox", filename="tokenizer.json"))
+    shutil.copy("./viterbox/tokenizer.json", output_dir / "tokenizer.json")
     
     # Save conditionals if they exist
     if model.conds:
