@@ -41,17 +41,17 @@ from collections import deque
 # Hardcoded configuration
 AUDIO_DATA_DIR = "/content/chatterbox-lora/audio_data"
 JSON_PATH = "/content/chatterbox-lora/audio_data/transcripts_cache.json"
-BATCH_SIZE = 16
+BATCH_SIZE = 1
 EPOCHS = 10
 LEARNING_RATE = 1e-4
-WARMUP_STEPS = 500 
-MAX_AUDIO_LENGTH = 15.0  
+WARMUP_STEPS = 50 
+MAX_AUDIO_LENGTH = 5.0  
 MIN_AUDIO_LENGTH = 1.0
-LORA_RANK = 64  
-LORA_ALPHA = 128  
+LORA_RANK = 32  
+LORA_ALPHA = 64  
 LORA_DROPOUT = 0.05  
-GRADIENT_ACCUMULATION_STEPS = 1
-SAVE_EVERY_N_STEPS = 1000
+GRADIENT_ACCUMULATION_STEPS = 8
+SAVE_EVERY_N_STEPS = 200
 CHECKPOINT_DIR = "checkpoints_lora"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 WHISPER_MODEL = "openai/whisper-large-v3-turbo"
@@ -395,7 +395,7 @@ class AudioSample:
 
 
 class TTSDataset(Dataset):
-    """Dataset handling"""
+    """Dataset handling with Real Length for Masking"""
     def __init__(
         self,
         samples: List[AudioSample],
@@ -418,22 +418,44 @@ class TTSDataset(Dataset):
     def __getitem__(self, idx):
         sample = self.samples[idx]
         
-        # Load and process audio - keep original length logic
+        # 1. Load audio gốc
         audio, sr = librosa.load(sample.audio_path, sr=self.s3gen_sr)
         
+        # [QUAN TRỌNG] Trim silence: Cắt bỏ khoảng lặng thừa ở đầu/đuôi
+        # Để đảm bảo 'real_len' là tiếng nói thật sự
+        audio, _ = librosa.effects.trim(audio, top_db=20)
         audio = librosa.util.normalize(audio)
         
-        # Keep original padding/trimming logic but improve it
+        # Lưu độ dài thật của bản gốc (để tính toán)
+        real_len_samples = len(audio)
+        
+        # 2. Pad audio gốc (cho S3Gen reference)
         max_samples = int(self.max_audio_length * self.s3gen_sr)
         if len(audio) > max_samples:
             audio = audio[:max_samples]
+            real_len_samples = max_samples # Cập nhật nếu bị cắt
         else:
             pad_amount = max_samples - len(audio)
             audio = np.pad(audio, (0, pad_amount), mode='constant', constant_values=0)
         
-        # Resample for S3 tokenizer
-        audio_16k = librosa.resample(audio, orig_sr=self.s3gen_sr, target_sr=self.s3_sr)
+        # 3. Resample và lấy độ dài thật ở hệ 16k
+        # Lưu ý: Phải tính real_len_16k TRƯỚC KHI PAD
+        real_len_16k = int(real_len_samples * (self.s3_sr / self.s3gen_sr))
         
+        # Resample phần audio thật
+        audio_16k = librosa.resample(audio[:real_len_samples], orig_sr=self.s3gen_sr, target_sr=self.s3_sr)
+        
+        # 4. Pad bản 16k lên max
+        max_samples_16k = int(self.max_audio_length * self.s3_sr)
+        if len(audio_16k) > max_samples_16k:
+             audio_16k = audio_16k[:max_samples_16k]
+             # Nếu bị cắt thì độ dài thật cũng bị cắt theo
+             real_len_16k = max_samples_16k 
+        else:
+             pad_16k = max_samples_16k - len(audio_16k)
+             # Đây là chỗ sinh ra số 0 gây lỗi EOS -> Ta sẽ mask nó ở bước sau
+             audio_16k = np.pad(audio_16k, (0, pad_16k), mode='constant', constant_values=0)
+
         # Process text
         text = punc_norm(sample.transcript)
         if len(text) > self.max_text_length:
@@ -444,6 +466,7 @@ class TTSDataset(Dataset):
             'audio_16k': torch.FloatTensor(audio_16k),
             'text': text,
             'audio_path': str(sample.audio_path),
+            'real_len_16k': real_len_16k  # <--- TRẢ VỀ CÁI NÀY
         }
 
 
@@ -539,26 +562,19 @@ def compute_loss(
     batch_size = batch['audio'].size(0)
     device = model.device
 
-    # ── text → tokens ────────────────────────────────────────────────────────────
+    # ── text → tokens ───────────────────────────────────────────────────────
     text_tokens_list = []
     for i in range(batch_size):
         text = batch['text'][i]
         tokens = model.tokenizer.text_to_tokens(text).to(device)
         text_tokens_list.append(tokens)
 
-    # Pad text tokens to same length
     max_text_len = max(t.size(-1) for t in text_tokens_list)
     text_tokens_padded = []
     for t in text_tokens_list:
         pad_amount = max_text_len - t.size(-1)
-        # Tbem padding
         if pad_amount > 0:
-            # SỬA THÀNH: Dùng getattr để lấy giá trị an toàn (mặc định là 0)
-            pad_val = getattr(model.tokenizer, 'pad_token_id', 0)
-            # Nếu getattr trả về None (trường hợp có thuộc tính nhưng giá trị None), ép về 0
-            if pad_val is None: 
-                pad_val = 0
-                
+            pad_val = getattr(model.tokenizer, 'pad_token_id', 0) or 0
             padded = F.pad(t, (0, pad_amount), value=pad_val)
         else:
             padded = t
@@ -566,69 +582,67 @@ def compute_loss(
     
     text_tokens = torch.cat(text_tokens_padded, dim=0)
 
-    # Add start/stop tokens if needed
     sot = model.t3.hp.start_text_token
     eot = model.t3.hp.stop_text_token
-    
-    # Check if we need to add start/stop tokens
     if text_tokens.size(1) == 0 or text_tokens[0, 0] != sot:
         text_tokens = F.pad(text_tokens, (1, 0), value=sot)
     if text_tokens.size(1) == 0 or text_tokens[0, -1] != eot:
         text_tokens = F.pad(text_tokens, (0, 1), value=eot)
 
-    # ── speech → tokens ─────────────────────────────────────────────────────────
+    # ── speech → tokens (ĐÃ FIX: CLONE + MASKING) ──────────────────────────
     s3_tokzr = model.s3gen.tokenizer
     MAX_TOKENIZER_SEC = 30
     MAX_TOKENIZER_SAMPLES = MAX_TOKENIZER_SEC * S3_SR
 
     target_tokens_list = []
+    
     for i in range(batch_size):
-        audio_16k = batch['audio_16k'][i].cpu().numpy()
+        audio_16k_np = batch['audio_16k'][i].cpu().numpy()
         
-        # Truncate if too long
-        if len(audio_16k) > MAX_TOKENIZER_SAMPLES:
-            audio_16k = audio_16k[:MAX_TOKENIZER_SAMPLES]
-        
-        # Ensure minimum length
-        if len(audio_16k) < S3_SR:  # Less than 1 second
-            pad_amount = S3_SR - len(audio_16k)
-            audio_16k = np.pad(audio_16k, (0, pad_amount), mode='constant')
-        
-        # Tokenize speech
-        tokens, _ = s3_tokzr.forward([audio_16k])
-        
+        if len(audio_16k_np) > MAX_TOKENIZER_SAMPLES:
+            audio_16k_np = audio_16k_np[:MAX_TOKENIZER_SAMPLES]
+            
+        tokens, _ = s3_tokzr.forward([audio_16k_np])
         if not isinstance(tokens, torch.Tensor):
             tokens = torch.from_numpy(tokens)
-        
-        # Ensure 2D
         if tokens.dim() == 1:
             tokens = tokens.unsqueeze(0)
+
+        # [FIX QUAN TRỌNG] Clone ra để sửa đổi không bị lỗi Runtime
+        tokens = tokens.clone()
+
+        # --- Logic Masking ---
+        real_len = batch['real_len_16k'][i]
+        total_samples = len(audio_16k_np)
+        total_tokens = tokens.size(1)
+        
+        valid_tokens_count = int((real_len / total_samples) * total_tokens)
+        valid_tokens_count = min(valid_tokens_count + 2, total_tokens)
+        
+        if valid_tokens_count < total_tokens:
+            tokens[:, valid_tokens_count:] = -100
             
         target_tokens_list.append(tokens)
 
-    # Pad speech tokens to same length
+    # Pad Speech Tokens
     max_speech_len = max(t.size(-1) for t in target_tokens_list)
     target_tokens_padded = []
     for t in target_tokens_list:
         pad_amount = max_speech_len - t.size(-1)
         if pad_amount > 0:
-            padded = F.pad(t, (0, pad_amount), value=-100)  # Use -100 for ignore_index
+            padded = F.pad(t, (0, pad_amount), value=-100)
         else:
             padded = t
         target_tokens_padded.append(padded)
     
     target_tokens = torch.cat(target_tokens_padded, dim=0).to(device)
 
-    # Print shapes for debugging
-    print(f"Text tokens shape: {text_tokens.shape}")
-    print(f"Target tokens shape: {target_tokens.shape}")
-    print(f"Batch size: {batch_size}")
+    # [FIX] Đã xóa hết print ở đây để không bị mất Log thanh tiến trình
 
-    # Classifier-free guidance: double the batch for CFG
+    # ── Forward & Loss ──────────────────────────────────────────────────────
     text_tokens_doubled = torch.cat([text_tokens, text_tokens], dim=0)
     target_tokens_doubled = torch.cat([target_tokens, target_tokens], dim=0)
     
-    # Double the conditioning
     t3_cond_doubled = T3Cond(
         speaker_emb=torch.cat([t3_cond.speaker_emb, t3_cond.speaker_emb], dim=0),
         cond_prompt_speech_tokens=torch.cat(
@@ -639,85 +653,41 @@ def compute_loss(
         ) if t3_cond.emotion_adv is not None else None,
     )
 
-    # ── forward pass ─────────────────────────────────────────────────────────────
-    # Use speech tokens for input (teacher forcing), excluding the last token
     input_speech_tokens = target_tokens_doubled[:, :-1]
-    
-    # Prepare embeddings
+    input_speech_tokens = input_speech_tokens.clone()
+    input_speech_tokens[input_speech_tokens == -100] = 0 
+
     embeds, len_cond = model.t3.prepare_input_embeds(
         t3_cond=t3_cond_doubled,
         text_tokens=text_tokens_doubled,
         speech_tokens=input_speech_tokens,
     )
     
-    print(f"Embeds shape: {embeds.shape}")
-    print(f"Conditioning length: {len_cond}")
-
-    # Forward through transformer
     if DEVICE == 'cuda':
         with torch.cuda.amp.autocast():
             hidden_states = model.t3.tfmr(inputs_embeds=embeds)[0]
     else:
         hidden_states = model.t3.tfmr(inputs_embeds=embeds)[0]
 
-    print(f"Hidden states shape: {hidden_states.shape}")
-
-    # Extract speech logits
-    speech_start = len_cond + text_tokens.size(1)  # Skip conditioning + text
-    speech_end = speech_start + target_tokens.size(1) - 1  # -1 because we excluded last token from input
-    
-    print(f"Speech logits slice: [{speech_start}:{speech_end}]")
-    
-    if speech_end > hidden_states.size(1):
-        print(f"WARNING: speech_end ({speech_end}) > hidden_states length ({hidden_states.size(1)})")
-        speech_end = hidden_states.size(1)
-    
-    if speech_start >= speech_end:
-        print(f"ERROR: Invalid speech slice [{speech_start}:{speech_end}]")
-        # Return a small loss to continue training
-        return torch.tensor(1.0, requires_grad=True, device=device)
+    speech_start = len_cond + text_tokens.size(1)
+    speech_end = speech_start + target_tokens.size(1) - 1
+    if speech_end > hidden_states.size(1): speech_end = hidden_states.size(1)
     
     speech_hidden = hidden_states[:, speech_start:speech_end]
     speech_logits = model.t3.speech_head(speech_hidden)
     
-    print(f"Speech logits shape: {speech_logits.shape}")
-
-    # Target tokens for loss (shifted by 1 for next-token prediction)
-    target_shifted = target_tokens_doubled[:, 1:]  # Exclude first token (start token)
-    
-    print(f"Target shifted shape: {target_shifted.shape}")
-
-    # Ensure shapes match
+    target_shifted = target_tokens_doubled[:, 1:]
     min_len = min(speech_logits.size(1), target_shifted.size(1))
     speech_logits = speech_logits[:, :min_len]
     target_shifted = target_shifted[:, :min_len]
     
-    print(f"Final shapes - logits: {speech_logits.shape}, targets: {target_shifted.shape}")
-
-    # Compute cross-entropy loss
     loss = F.cross_entropy(
-        speech_logits.reshape(-1, speech_logits.size(-1)),  # (batch*seq, vocab)
-        target_shifted.reshape(-1),  # (batch*seq,)
+        speech_logits.reshape(-1, speech_logits.size(-1)),
+        target_shifted.reshape(-1),
         ignore_index=-100,
     )
     
-    print(f"Computed loss: {loss.item():.6f}")
-
-    # Sanity checks
-    if torch.isnan(loss):
-        print("ERROR: NaN loss detected!")
-        return torch.tensor(1.0, requires_grad=True, device=device)
-    
-    if torch.isinf(loss):
-        print("ERROR: Infinite loss detected!")
-        return torch.tensor(1.0, requires_grad=True, device=device)
-    
-    if loss.item() == 0.0:
-        print("WARNING: Zero loss - check if targets are all ignore_index (-100)")
-        print(f"Number of non-ignore targets: {(target_shifted != -100).sum().item()}")
-    
     return loss
-
 
 def main():
     """Main training function"""
@@ -1139,13 +1109,14 @@ def load_lora_adapter(model: ChatterboxTTS, filepath: str, device: str = 'cuda')
 
 
 def collate_fn(samples):
-   """Custom collate function for DataLoader"""
-   return {
-       'audio': torch.stack([s['audio'] for s in samples]),
-       'audio_16k': torch.stack([s['audio_16k'] for s in samples]),
-       'text': [s['text'] for s in samples],
-       'audio_path': [s['audio_path'] for s in samples],
-   }
+    """Custom collate function for DataLoader"""
+    return {
+        'audio': torch.stack([s['audio'] for s in samples]),
+        'audio_16k': torch.stack([s['audio_16k'] for s in samples]),
+        'text': [s['text'] for s in samples],
+        'audio_path': [s['audio_path'] for s in samples],
+        'real_len_16k': [s['real_len_16k'] for s in samples] # <--- THÊM DÒNG NÀY
+    }
 
 
 if __name__ == "__main__":
