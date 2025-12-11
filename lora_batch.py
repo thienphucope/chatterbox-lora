@@ -39,18 +39,19 @@ import time
 from collections import deque
 
 # Hardcoded configuration
-AUDIO_DATA_DIR = "./audio_data"
-BATCH_SIZE = 1
+AUDIO_DATA_DIR = "/content/chatterbox-lora/audio_data"
+JSON_PATH = "/content/chatterbox-lora/audio_data/transcripts_cache.json"
+BATCH_SIZE = 16
 EPOCHS = 10
-LEARNING_RATE = 2e-5  
+LEARNING_RATE = 1e-4
 WARMUP_STEPS = 500 
-MAX_AUDIO_LENGTH = 400.0  
+MAX_AUDIO_LENGTH = 15.0  
 MIN_AUDIO_LENGTH = 1.0
-LORA_RANK = 32  
-LORA_ALPHA = 64  
+LORA_RANK = 64  
+LORA_ALPHA = 128  
 LORA_DROPOUT = 0.05  
-GRADIENT_ACCUMULATION_STEPS = 8
-SAVE_EVERY_N_STEPS = 200
+GRADIENT_ACCUMULATION_STEPS = 1
+SAVE_EVERY_N_STEPS = 1000
 CHECKPOINT_DIR = "checkpoints_lora"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 WHISPER_MODEL = "openai/whisper-large-v3-turbo"
@@ -968,80 +969,73 @@ def main():
     print("\nTo load the LoRA adapter:")
     print(f"  lora_layers = load_lora_adapter(model, '{final_adapter_path}')")
 
-def load_audio_samples(audio_dir: str, whisper_model) -> List[AudioSample]:
-   """Load audio files and generate transcripts using Whisper"""
-   samples = []
-   audio_extensions = ['.wav', '.mp3', '.flac', '.ogg', '.m4a']
-   
-   # Cache file for transcripts
-   cache_file = Path(audio_dir) / "transcripts_cache.json"
-   transcript_cache = {}
-   
-   # Load existing cache if available
-   if cache_file.exists():
-       print(f"Loading transcript cache from {cache_file}")
-       with open(cache_file, 'r', encoding='utf-8') as f:
-           transcript_cache = json.load(f)
-   
-   print(f"Loading audio files from {audio_dir}...")
-   audio_files = []
-   for ext in audio_extensions:
-       audio_files.extend(Path(audio_dir).glob(f"*{ext}"))
-   
-   print(f"Found {len(audio_files)} audio files")
-   
-   # Track if we need to update cache
-   cache_updated = False
-   
-   for audio_path in tqdm(audio_files, desc="Processing audio"):
-       try:
-           # Load audio for duration check
-           audio, sr = librosa.load(audio_path, sr=None)
-           duration = len(audio) / sr
-           
-           # Skip if too short or too long
-           if duration < MIN_AUDIO_LENGTH or duration > MAX_AUDIO_LENGTH:
-               continue
-           
-           # Check if we have cached transcript
-           audio_path_str = str(audio_path.relative_to(Path(audio_dir)))
-           
-           if audio_path_str in transcript_cache:
-               transcript = transcript_cache[audio_path_str]['transcript']
-               print(f"Using cached transcript for {audio_path.name}")
-           else:
-               # Transcribe with Whisper
-               print(f"\nTranscribing {audio_path.name}...")
-               result = whisper_model(str(audio_path), return_timestamps=True)
-               transcript = result['text'].strip()
-               
-               # Add to cache
-               transcript_cache[audio_path_str] = {
-                   'transcript': transcript,
-                   'duration': duration,
-                   'sample_rate': sr
-               }
-               cache_updated = True
-           
-           if transcript:
-               samples.append(AudioSample(
-                   audio_path=audio_path,
-                   transcript=transcript,
-                   duration=duration,
-                   sample_rate=sr
-               ))
-       except Exception as e:
-           print(f"Error processing {audio_path}: {e}")
-           continue
-   
-   # Save updated cache
-   if cache_updated:
-       print(f"Saving transcript cache to {cache_file}")
-       with open(cache_file, 'w', encoding='utf-8') as f:
-           json.dump(transcript_cache, f, ensure_ascii=False, indent=2)
-   
-   print(f"Successfully loaded {len(samples)} samples")
-   return samples
+def load_audio_samples(root_dir: str, whisper_model=None) -> List[AudioSample]:
+    """
+    Load audio samples based on the JSON cache map.
+    root_dir: The root folder containing all dataset subfolders (e.g., splitthienfinal)
+    """
+    samples = []
+    
+    # Đường dẫn cố định đến file JSON mà chúng ta đã tạo ở bước trước
+    # Bạn có thể sửa lại nếu file nằm chỗ khác
+    json_path = JSON_PATH
+    cache_file = Path(json_path)
+    
+    if not cache_file.exists():
+        raise FileNotFoundError(f"❌ Không tìm thấy file JSON tại: {json_path}. Hãy chạy script tạo JSON trước!")
+
+    print(f"📖 Đang đọc bản đồ dữ liệu từ: {json_path}")
+    with open(cache_file, 'r', encoding='utf-8') as f:
+        transcript_cache = json.load(f)
+    
+    print(f"🔍 Tìm thấy {len(transcript_cache)} entries trong JSON.")
+    print(f"📂 Đang kiểm tra file thực tế tại root: {root_dir}")
+
+    # Root path trên Drive
+    root_path_obj = Path(root_dir)
+    
+    missing_count = 0
+    
+    # Duyệt qua từng entry trong JSON
+    # Key = đường dẫn tương đối (dataset-X/wavs/file.wav)
+    # Value = dữ liệu (text, duration...)
+    for relative_path_str, data in tqdm(transcript_cache.items(), desc="Loading Samples"):
+        try:
+            # Tạo đường dẫn tuyệt đối: Root + Relative
+            # VD: /content/drive/.../splitthienfinal/dataset-A/wavs/chunk.wav
+            full_audio_path = root_path_obj / relative_path_str
+            
+            # Kiểm tra file có tồn tại không
+            if not full_audio_path.exists():
+                missing_count += 1
+                if missing_count <= 5: # Chỉ in 5 lỗi đầu tiên
+                     print(f"⚠️ Missing: {full_audio_path}")
+                continue
+
+            # Lấy text từ JSON
+            transcript = data.get('transcript', "").strip()
+            if not transcript:
+                continue
+
+            # Thêm vào danh sách samples
+            samples.append(AudioSample(
+                audio_path=full_audio_path,
+                transcript=transcript,
+                # Duration/Sample rate code train sẽ tự check lại khi load batch
+                # Nhưng ta lấy từ JSON nếu có để tham khảo
+                duration=data.get('duration', 0.0), 
+                sample_rate=data.get('sample_rate', 22050)
+            ))
+
+        except Exception as e:
+            print(f"❌ Error processing {relative_path_str}: {e}")
+            continue
+
+    if missing_count > 0:
+        print(f"⚠️ Cảnh báo: Có {missing_count} file trong JSON không tìm thấy trên ổ đĩa.")
+    
+    print(f"✅ Đã load thành công {len(samples)} mẫu dữ liệu hợp lệ.")
+    return samples
 
 
 def save_checkpoint(
