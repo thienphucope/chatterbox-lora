@@ -23,8 +23,7 @@ def load_model():
 
 def generate(model, text, audio_prompt_path, exaggeration, temperature, seed_num, cfgw):
     if model is None:
-        model = ChatterboxTTS.from_pretrained(DEVICE)
-
+        model = ChatterboxTTS.from_local("./checkpoints_lora/merged_model", DEVICE)
     if seed_num != 0:
         set_seed(int(seed_num))
 
