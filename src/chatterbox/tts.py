@@ -264,13 +264,6 @@ class ChatterboxTTS:
             speech_tokens = drop_invalid_tokens(speech_tokens)
             speech_tokens = speech_tokens.to(self.device)
 
-            # =========== BẮT ĐẦU ĐOẠN SỬA ===========
-            # Fix lỗi input quá ngắn cho S3Gen
-            if len(speech_tokens) > 0 and len(speech_tokens) < 3:
-                pad_amount = 3 - len(speech_tokens)
-                speech_tokens = F.pad(speech_tokens, (0, pad_amount), value=speech_tokens[-1])
-            # =========== KẾT THÚC ĐOẠN SỬA ===========
-
             wav, _ = self.s3gen.inference(
                 speech_tokens=speech_tokens,
                 ref_dict=self.conds.gen,
