@@ -268,9 +268,74 @@ class ChatterboxTTS:
                 speech_tokens=speech_tokens,
                 ref_dict=self.conds.gen,
             )
-            wav = wav.squeeze(0).detach().cpu().numpy()
-            watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-        return torch.from_numpy(watermarked_wav).unsqueeze(0)
+        #     wav = wav.squeeze(0).detach().cpu().numpy()
+        #     watermarked_wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
+        # return torch.from_numpy(watermarked_wav).unsqueeze(0)
+        wav_np = wav[0].cpu().numpy()
+
+        # Đếm số từ
+        clean_text = text.replace('.', '').replace(',', '').replace('?', '').replace('!', '')
+        num_words = len(clean_text.strip().split())
+
+        if num_words > 0 and num_words < 10:  # Chỉ xử lý khi < 10 từ
+            # Tính spectral flux (phát hiện thay đổi âm sắc giữa các từ)
+            hop_length = 256
+            spec = np.abs(librosa.stft(wav_np, hop_length=hop_length))
+            flux = np.sqrt(np.sum(np.diff(spec, axis=1)**2, axis=0))
+            flux = np.concatenate([[0], flux])  # Padding
+            
+            # Smooth để giảm nhiễu
+            from scipy.ndimage import gaussian_filter1d
+            flux_smooth = gaussian_filter1d(flux, sigma=2)
+            
+            # Tìm các peak (điểm thay đổi mạnh = biên từ)
+            from scipy.signal import find_peaks, argrelextrema
+            peaks, properties = find_peaks(
+                flux_smooth,
+                height=np.percentile(flux_smooth, 60),
+                distance=int(self.sr * 0.08 / hop_length),
+                prominence=np.std(flux_smooth) * 0.3
+            )
+            
+            print(f"  [Word Boundary Detection] Detected {len(peaks)} boundaries for {num_words} words")
+            
+            if len(peaks) >= num_words:
+                print(f"  [Trimming] Cutting after word {num_words}")
+                
+                # Lấy boundary thứ num_words
+                target_peak = peaks[num_words - 1]
+                
+                # Tìm tất cả các valley (điểm thấp) SAU peak - tìm xa hơn
+                search_start = target_peak
+                search_end = min(len(flux_smooth), target_peak + int(self.sr * 0.8 / hop_length))  # 800ms
+                search_region = flux_smooth[search_start:search_end]
+                
+                # Tìm các local minima (thung lũng)
+                valleys = argrelextrema(search_region, np.less, order=5)[0]  # order=5 để bắt valley rõ hơn
+                
+                if len(valleys) > 0:
+                    # Lấy valley THẤP NHẤT (deepest valley - xuống hết cỡ)
+                    deepest_valley = valleys[np.argmin(search_region[valleys])]
+                    valley_idx = search_start + deepest_valley
+                else:
+                    # Nếu không tìm thấy valley, lấy điểm thấp nhất
+                    valley_idx = search_start + np.argmin(search_region)
+                
+                # Chuyển về sample
+                cut_point = valley_idx * hop_length
+                
+                wav_np = wav_np[:cut_point]
+                
+                # Áp dụng fade out (50ms) ở cuối để tránh tiếng bụp
+                fade_length = int(self.sr * 0.05)  # 50ms
+                if len(wav_np) > fade_length:
+                    fade_curve = np.linspace(1.0, 0.0, fade_length)
+                    wav_np[-fade_length:] *= fade_curve
+                
+                # Trim silence nhẹ
+                wav_np, _ = librosa.effects.trim(wav_np, top_db=25)
+
+        return wav_np
 
     def inference_stream(
         self,
