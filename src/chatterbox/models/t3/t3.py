@@ -333,6 +333,14 @@ class T3(nn.Module):
             # Apply temperature scaling.
             if temperature != 1.0:
                 logits = logits / temperature
+                
+            # =========== BẮT ĐẦU ĐOẠN SỬA ===========
+    
+            if i <= 0: # TOKEN ĐẦU LO MÀ NHẢ TOKEN RA
+                eos_idx = self.hp.stop_speech_token
+                logits[:, eos_idx] = float('-inf')
+                
+            # =========== KẾT THÚC ĐOẠN SỬA ===========
 
             # Apply repetition penalty and top‑p filtering.
             logits = repetition_penalty_processor(generated_ids, logits)
