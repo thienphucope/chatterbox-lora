@@ -34,7 +34,7 @@ def generate(model, text, audio_prompt_path, exaggeration, temperature, seed_num
         temperature=temperature,
         cfg_weight=cfgw,
     )
-    return (model.sr, wav.squeeze(0).numpy())
+    return (model.sr, wav.squeeze())
 
 
 with gr.Blocks() as demo:
