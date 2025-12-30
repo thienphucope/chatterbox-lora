@@ -617,7 +617,7 @@ def compute_loss(
         total_tokens = tokens.size(1)
         
         valid_tokens_count = int((real_len / total_samples) * total_tokens)
-        valid_tokens_count = min(valid_tokens_count + 2, total_tokens)
+        valid_tokens_count = min(valid_tokens_count, total_tokens)
         
         if valid_tokens_count < total_tokens:
             tokens[:, valid_tokens_count:] = -100
