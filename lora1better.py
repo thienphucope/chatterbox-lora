@@ -528,127 +528,129 @@ def compute_loss(
     
     device = model.device
     
-    # --- 1. PREPARE TEXT TOKENS ---
+    # --- 1. PREPARE TEXT TOKENS (CONDITIONAL) ---
     text = batch['text'][0]
     text_tokens = model.tokenizer.text_to_tokens(text).to(device)
     
     sot_txt = model.t3.hp.start_text_token
     eot_txt = model.t3.hp.stop_text_token
+    pad_txt = 0 # Kiểm tra lại ID pad trong tokenizer của cậu
     
     if text_tokens.dim() == 1: text_tokens = text_tokens.unsqueeze(0)
     
-    # Add start/end text tokens
+    # Wrap SOT/EOT
     if text_tokens.size(1) == 0 or text_tokens[0, 0] != sot_txt:
         text_tokens = F.pad(text_tokens, (1, 0), value=sot_txt)
     if text_tokens.size(1) == 0 or text_tokens[0, -1] != eot_txt:
         text_tokens = F.pad(text_tokens, (0, 1), value=eot_txt)
 
-    # --- 2. PREPARE SPEECH TOKENS (WITH STOP PRESSURE) ---
+    # --- 2. PREPARE UNCONDITIONAL TEXT & ATTENTION MASK (THE FIX) ---
+    seq_len_text = text_tokens.size(1)
+    
+    # Tạo Uncond: [SOT, EOT, PAD, PAD...]
+    # Phải pad cho bằng độ dài text thật để stack được tensor
+    uncond_text = torch.full_like(text_tokens, pad_txt)
+    uncond_text[:, 0] = sot_txt
+    uncond_text[:, 1] = eot_txt
+    
+    # STACK: [Cond, Uncond]
+    text_tokens_doubled = torch.cat([text_tokens, uncond_text], dim=0) # (2, L)
+
+    # TẠO TEXT MASK RIÊNG:
+    # Cond: [1, 1, 1, ..., 1] (Lấy hết)
+    # Uncond: [1, 1, 0, ..., 0] (Chỉ lấy SOT, EOT; bỏ qua PAD)
+    text_mask_cond = torch.ones_like(text_tokens)
+    text_mask_uncond = torch.zeros_like(uncond_text)
+    text_mask_uncond[:, 0] = 1 # SOT
+    text_mask_uncond[:, 1] = 1 # EOT
+    
+    text_mask_doubled = torch.cat([text_mask_cond, text_mask_uncond], dim=0) # (2, L)
+
+    # --- 3. PREPARE SPEECH (Doubling) ---
+    # ... (Giữ nguyên logic Stop Token của cậu) ...
     s3_tokzr = model.s3gen.tokenizer
-    
-    # Special Tokens
-    start_speech_token = model.t3.hp.start_speech_token # 6561
-    stop_speech_token = model.t3.hp.stop_speech_token   # 6562
-    
-    # Chừa chỗ cho token Stop
-    MAX_SPEECH_CTX = 4096 - 10 
+    start_speech_token = model.t3.hp.start_speech_token 
+    stop_speech_token = model.t3.hp.stop_speech_token
     
     audio_16k = batch['audio_16k'][0].cpu().numpy()
     target_tokens_raw, _ = s3_tokzr.forward([audio_16k])
-    
-    if not isinstance(target_tokens_raw, torch.Tensor):
-        target_tokens = torch.from_numpy(target_tokens_raw)
+    if isinstance(target_tokens_raw, torch.Tensor):
+        target_tokens = target_tokens_raw.to(device)
     else:
-        target_tokens = target_tokens_raw
+        target_tokens = torch.from_numpy(target_tokens_raw).to(device)
+    if target_tokens.dim() == 1: target_tokens = target_tokens.unsqueeze(0)
 
-    if target_tokens.dim() == 1:
-        target_tokens = target_tokens.unsqueeze(0) # (1, Seq)
-
-    # === CORE LOGIC: FORCE STOP TOKEN ===
+    # Cắt dài + thêm Stop/Start
+    MAX_SPEECH = 4096 - 256
+    if target_tokens.size(1) > MAX_SPEECH: target_tokens = target_tokens[:, :MAX_SPEECH]
     
-    # 1. Cắt nếu quá dài (để chừa chỗ cho EOS)
-    if target_tokens.size(1) > MAX_SPEECH_CTX:
-        target_tokens = target_tokens[:, :MAX_SPEECH_CTX]
-    
-    target_tokens = target_tokens.to(device)
-    
-    # 2. Tạo Input Speech: Phải bắt đầu bằng Start Token
-    # Input sequence: [Start, T1, T2, ..., Tn]
-    input_speech_tokens = F.pad(target_tokens, (1, 0), value=start_speech_token)
-    
-    # 3. Tạo Target Speech: Phải kết thúc bằng Stop Token
-    # Target sequence: [T1, T2, ..., Tn, Stop]
-    # Lưu ý: target_tokens ở đây là [T1...Tn], ta nối thêm [Stop] vào đuôi
+    input_speech = F.pad(target_tokens, (1, 0), value=start_speech_token)
     stop_tensor = torch.tensor([[stop_speech_token]], device=device, dtype=target_tokens.dtype)
-    target_speech_tokens = torch.cat([target_tokens, stop_tensor], dim=1)
+    target_speech = torch.cat([target_tokens, stop_tensor], dim=1)
     
-    # Kiểm tra lại độ dài Input và Target phải bằng nhau (vì shift 1 vị trí)
-    # Input:  [Start, T1, ..., Tn] (Len = N+1)
-    # Target: [T1, ..., Tn, Stop]  (Len = N+1)
-    
-    # --- 3. PREPARE INPUTS FOR CFG ---
-    text_tokens_doubled = torch.cat([text_tokens, text_tokens], dim=0)
-    
-    # Nhân đôi input speech
-    input_speech_doubled = torch.cat([input_speech_tokens, input_speech_tokens], dim=0)
-    
-    # Nhân đôi target speech
-    target_speech_doubled = torch.cat([target_speech_tokens, target_speech_tokens], dim=0)
-    
-    # Conditional stuff
+    # Doubling Speech
+    input_speech_doubled = torch.cat([input_speech, input_speech], dim=0)
+    target_speech_doubled = torch.cat([target_speech, target_speech], dim=0)
+
+    # Speech Mask: Luôn là 1 cho cả 2 nhánh (vì ta cần dự đoán speech ở cả 2 trường hợp)
+    speech_mask_doubled = torch.ones_like(input_speech_doubled)
+
+    # --- 4. PREPARE CONDITIONALS (Leakage Awareness) ---
+    # Note: Đây là Text-CFG, Speaker/Emotion vẫn giữ nguyên ở nhánh Uncond.
     cond_tokens = t3_cond.cond_prompt_speech_tokens
-    # Handle empty condition case safely
     if cond_tokens.numel() == 0:
-        cond_doubled_tokens = torch.empty(2, 0, dtype=torch.long, device=device)
-    elif cond_tokens.dim() == 2:
-        cond_doubled_tokens = torch.cat([cond_tokens, cond_tokens], dim=0)
+        cond_tokens_doubled = torch.empty(2, 0, dtype=torch.long, device=device)
+        cond_mask_doubled = torch.empty(2, 0, dtype=torch.long, device=device)
     else:
-        cond_doubled_tokens = torch.cat([cond_tokens, cond_tokens], dim=0)
+        cond_tokens_doubled = torch.cat([cond_tokens, cond_tokens], dim=0)
+        cond_mask_doubled = torch.ones_like(cond_tokens_doubled) # Prompt luôn được attend
 
     t3_cond_doubled = T3Cond(
         speaker_emb=torch.cat([t3_cond.speaker_emb, t3_cond.speaker_emb], dim=0),
-        cond_prompt_speech_tokens=cond_doubled_tokens,
+        cond_prompt_speech_tokens=cond_tokens_doubled,
         emotion_adv=torch.cat([t3_cond.emotion_adv, t3_cond.emotion_adv], dim=0) if t3_cond.emotion_adv is not None else None,
     )
 
-    # --- 4. EMBEDDING & MASK ---
+    # --- 5. FORWARD VỚI MASK CHUẨN ---
+    # Tự ghép Mask tổng thể: [Cond Prompt | Text | Speech]
+    # Thứ tự ghép phụ thuộc vào logic của model.t3.prepare_input_embeds
+    # Thường Chatterbox xếp: [Cond Tokens, Text Tokens, Speech Tokens]
+    
     embeds, len_cond = model.t3.prepare_input_embeds(
         t3_cond=t3_cond_doubled,
         text_tokens=text_tokens_doubled,
         speech_tokens=input_speech_doubled,
     )
     
-    b_sz, seq_len, _ = embeds.shape
-    attention_mask = torch.ones((b_sz, seq_len), device=device, dtype=torch.long)
+    # GHÉP MASK TỔNG (QUAN TRỌNG NHẤT)
+    # Lưu ý: Cần đảm bảo thứ tự khớp với embeds. 
+    # Logic thông thường: [Prompt_Mask, Text_Mask, Speech_Mask]
+    full_attention_mask = torch.cat([cond_mask_doubled, text_mask_doubled, speech_mask_doubled], dim=1)
     
-    # --- 5. FORWARD ---
+    # Sanity check: Mask shape phải khớp Embeds shape
+    if full_attention_mask.size(1) != embeds.size(1):
+        # Fallback nếu prepare_input_embeds có thêm token đặc biệt nào đó
+        # Nhưng với mask chủ động thế này là an toàn nhất cho CFG
+        diff = embeds.size(1) - full_attention_mask.size(1)
+        if diff > 0:
+            full_attention_mask = F.pad(full_attention_mask, (0, diff), value=1)
+
     if DEVICE == 'cuda':
         with torch.cuda.amp.autocast():
-            hidden_states = model.t3.tfmr(inputs_embeds=embeds, attention_mask=attention_mask)[0]
+            hidden_states = model.t3.tfmr(inputs_embeds=embeds, attention_mask=full_attention_mask)[0]
     else:
-        hidden_states = model.t3.tfmr(inputs_embeds=embeds, attention_mask=attention_mask)[0]
+        hidden_states = model.t3.tfmr(inputs_embeds=embeds, attention_mask=full_attention_mask)[0]
 
     # --- 6. LOSS CALCULATION ---
-    text_len = text_tokens.size(1)
-    # Speech bắt đầu sau Cond + Text
-    speech_start = len_cond + text_len
-    
-    # Lấy output tương ứng với phần Speech Input
-    # Output tại vị trí [Start] dùng để dự đoán [T1]
-    # ...
-    # Output tại vị trí [Tn] dùng để dự đoán [Stop]
-    speech_hidden = hidden_states[:, speech_start : speech_start + input_speech_tokens.size(1)]
+    speech_start = len_cond + text_tokens_doubled.size(1)
+    speech_hidden = hidden_states[:, speech_start : speech_start + input_speech_doubled.size(1)]
     speech_logits = model.t3.speech_head(speech_hidden)
     
-    # Sanity check dimensions
-    if speech_logits.shape[1] != target_speech_doubled.shape[1]:
-        # print(f"Mismatch: Logits {speech_logits.shape} vs Target {target_speech_doubled.shape}")
-        min_len = min(speech_logits.shape[1], target_speech_doubled.shape[1])
-        speech_logits = speech_logits[:, :min_len]
-        target_speech_doubled = target_speech_doubled[:, :min_len]
+    # Sync length
+    min_len = min(speech_logits.shape[1], target_speech_doubled.shape[1])
+    speech_logits = speech_logits[:, :min_len]
+    target_speech_doubled = target_speech_doubled[:, :min_len]
 
-    # Compute Loss
-    # Bây giờ target_speech_doubled chắc chắn có chứa Stop Token ở cuối
     loss = F.cross_entropy(
         speech_logits.reshape(-1, speech_logits.size(-1)),
         target_speech_doubled.reshape(-1),
